@@ -40,3 +40,30 @@ class IDM(nn.Module):
 
     def forward(self, x):
         return self.head(self.encoder(x).flatten(1))
+
+
+class IDMSiamese(nn.Module):
+    """Siamese IDM: f0 and f1 encoded with shared weights.
+    Head sees [z0, z1, z1-z0] -- explicit feature-level diff signal."""
+
+    def __init__(self, action_dim=2):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            ResBlock(3, 32, stride=2),
+            ResBlock(32, 64, stride=2),
+            ResBlock(64, 128, stride=2),
+            ResBlock(128, 256, stride=2),
+            ResBlock(256, 512, stride=1),
+            nn.AdaptiveAvgPool2d((1, 1)),
+        )
+        self.head = nn.Sequential(
+            nn.Linear(512 * 3, 256),  # z0, z1, z1-z0
+            nn.ReLU(inplace=True),
+            nn.Linear(256, action_dim),
+        )
+
+    def forward(self, x):
+        f0, f1 = x[:, :3], x[:, 3:]
+        z0 = self.encoder(f0).flatten(1)
+        z1 = self.encoder(f1).flatten(1)
+        return self.head(torch.cat([z0, z1, z1 - z0], dim=1))
