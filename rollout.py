@@ -1,8 +1,8 @@
 """
-rollout.py — video model + IDM inference pipeline
+rollout.py -- video model + IDM inference pipeline
 
-Video model:   past frames (B, T, 3, H, W) → predicted frame_t+1 (B, 3, H, W)
-IDM:           (frame_t ‖ predicted_frame_t+1) → action (B, 2)
+Video model:   past frames (B, T, 3, H, W) -> predicted frame_t+1 (B, 3, H, W)
+IDM:           (frame_t || predicted_frame_t+1) -> action (B, 2)
 
 Usage:
   uv run --with modal modal run --detach rollout.py \
@@ -29,133 +29,9 @@ image = (
         "huggingface_hub",
         "tqdm",
     )
+    .add_local_python_source("idm")
 )
 
-
-# ── Model definitions (must match train.py) ───────────────────────────────────
-
-def build_idm():
-    import torch
-    import torch.nn as nn
-    import torch.nn.functional as F
-
-    class ResBlock(nn.Module):
-        def __init__(self, in_ch, out_ch, stride=1):
-            super().__init__()
-            self.conv1 = nn.Conv2d(in_ch, out_ch, 3, stride=stride, padding=1, bias=False)
-            self.bn1   = nn.BatchNorm2d(out_ch)
-            self.conv2 = nn.Conv2d(out_ch, out_ch, 3, stride=1, padding=1, bias=False)
-            self.bn2   = nn.BatchNorm2d(out_ch)
-            self.skip  = nn.Sequential(
-                nn.Conv2d(in_ch, out_ch, 1, stride=stride, bias=False),
-                nn.BatchNorm2d(out_ch),
-            ) if (stride != 1 or in_ch != out_ch) else nn.Identity()
-
-        def forward(self, x):
-            return F.relu(self.bn2(self.conv2(F.relu(self.bn1(self.conv1(x))))) + self.skip(x))
-
-    class IDM(nn.Module):
-        def __init__(self, action_dim=2):
-            super().__init__()
-            self.encoder = nn.Sequential(
-                ResBlock(6,   32,  stride=2),
-                ResBlock(32,  64,  stride=2),
-                ResBlock(64,  128, stride=2),
-                ResBlock(128, 256, stride=2),
-                ResBlock(256, 512, stride=1),   # deeper before pooling
-                nn.AdaptiveAvgPool2d((1, 1)),
-            )
-            self.head = nn.Sequential(
-                nn.Linear(512, 256),
-                nn.ReLU(inplace=True),
-                nn.Linear(256, action_dim),
-            )
-        def forward(self, x):
-            return self.head(self.encoder(x).flatten(1))
-
-    return IDM(action_dim=2)
-
-
-class VideoModel:
-    """
-    Interface for any video prediction model.
-    Subclass this and implement `predict_next_frame`.
-
-    Args:
-        past_frames: (B, T, 3, H, W) float32 in [0, 1]
-    Returns:
-        predicted next frame: (B, 3, H, W) float32 in [0, 1]
-    """
-    def predict_next_frame(self, past_frames):
-        raise NotImplementedError
-
-    def load_weights(self, ckpt_path):
-        raise NotImplementedError
-
-
-class LastFrameBaseline(VideoModel):
-    """Trivial baseline: predicts that the next frame == the last frame."""
-    def predict_next_frame(self, past_frames):
-        return past_frames[:, -1]   # (B, 3, H, W)
-
-    def load_weights(self, ckpt_path):
-        pass  # no weights
-
-
-class TorchScriptVideoModel(VideoModel):
-    """
-    Wraps any TorchScript-exported video model.
-    Expects the model's forward signature:
-        forward(past_frames: Tensor[B, T, 3, H, W]) -> Tensor[B, 3, H, W]
-    """
-    def __init__(self, device="cuda"):
-        self.model = None
-        self.device = device
-
-    def load_weights(self, ckpt_path):
-        import torch
-        self.model = torch.jit.load(ckpt_path, map_location=self.device)
-        self.model.eval()
-
-    def predict_next_frame(self, past_frames):
-        import torch
-        with torch.no_grad():
-            return self.model(past_frames.to(self.device))
-
-
-class CheckpointVideoModel(VideoModel):
-    """
-    Wraps a nn.Module whose state_dict is stored in a standard torch checkpoint.
-    Override `build_model` to return your architecture, then load_weights will
-    fill in the state dict.
-
-    Example:
-        class MyVideoModel(CheckpointVideoModel):
-            def build_model(self):
-                return MyConvLSTM(...)
-    """
-    def __init__(self, device="cuda"):
-        self.model = None
-        self.device = device
-
-    def build_model(self):
-        raise NotImplementedError("Override build_model() with your architecture.")
-
-    def load_weights(self, ckpt_path):
-        import torch
-        self.model = self.build_model().to(self.device)
-        ckpt = torch.load(ckpt_path, map_location=self.device)
-        state = ckpt.get("model_state_dict", ckpt)
-        self.model.load_state_dict(state)
-        self.model.eval()
-
-    def predict_next_frame(self, past_frames):
-        import torch
-        with torch.no_grad():
-            return self.model(past_frames.to(self.device))
-
-
-# ── Modal function ─────────────────────────────────────────────────────────────
 
 @app.function(
     image=image,
@@ -183,7 +59,8 @@ def rollout(
     import wandb
     from tqdm import tqdm
 
-    IMG_H, IMG_W = 90, 160
+    from idm import IDM, TorchScriptVideoModel, LastFrameBaseline, preprocess, IMG_H, IMG_W
+
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
     run = wandb.init(
@@ -201,21 +78,20 @@ def rollout(
     print(f"wandb run: {run.url}")
 
     # ── Load IDM ──────────────────────────────────────────────────────────────
-    idm = build_idm().to(DEVICE)
+    idm_model = IDM(action_dim=2).to(DEVICE)
     ckpt = torch.load(idm_ckpt, map_location=DEVICE)
     state = ckpt.get("model_state_dict", ckpt)
     # strip torch.compile prefix if present
     state = {k.replace("_orig_mod.", ""): v for k, v in state.items()}
-    idm.load_state_dict(state)
-    idm.eval()
+    idm_model.load_state_dict(state)
+    idm_model.eval()
 
     act_mean = torch.tensor(ckpt["act_mean"], dtype=torch.float32, device=DEVICE)
-    act_std  = torch.tensor(ckpt["act_std"],  dtype=torch.float32, device=DEVICE)
+    act_std = torch.tensor(ckpt["act_std"], dtype=torch.float32, device=DEVICE)
     print(f"IDM loaded from {idm_ckpt}")
 
     # ── Load video model ──────────────────────────────────────────────────────
     if video_model_ckpt:
-        # Auto-detect: TorchScript (.pt with jit) vs state dict
         try:
             vm = TorchScriptVideoModel(device=DEVICE)
             vm.load_weights(video_model_ckpt)
@@ -250,14 +126,9 @@ def rollout(
     local_paths = [os.path.join(npz_dir, os.path.basename(f)) for f in all_files]
 
     # ── Eval loop ─────────────────────────────────────────────────────────────
-    def preprocess(frame_np):
-        """(H, W, 3) uint8 → (1, 3, img_h, img_w) float32"""
-        t = torch.from_numpy(frame_np).permute(2, 0, 1).float().unsqueeze(0) / 255.0
-        return F.interpolate(t, size=(IMG_H, IMG_W), mode="bilinear", align_corners=False)
-
-    mae_idm_gt   = []   # IDM(real_t, real_t+1)    vs gt  — upper bound
-    mae_vm_idm   = []   # IDM(real_t, pred_t+1)    vs gt  — main metric
-    mae_baseline = []   # IDM(real_t, real_t)       vs gt  — trivial baseline
+    mae_idm_gt = []    # IDM(real_t, real_t+1)   vs gt  — upper bound
+    mae_vm_idm = []    # IDM(real_t, pred_t+1)   vs gt  — main metric
+    mae_baseline = []  # IDM(real_t, real_t)      vs gt  — trivial baseline
 
     rng = np.random.default_rng(42)
     paths_eval = rng.choice(local_paths, size=min(n_eval_sequences, len(local_paths)), replace=False)
@@ -267,7 +138,7 @@ def rollout(
             data = np.load(p)
         except Exception:
             continue
-        frames  = data["frames"]   # (T, H, W, 3)
+        frames = data["frames"]    # (T, H, W, 3)
         actions = data["actions"]  # (T, 2)
         T = frames.shape[0]
         if T < context_frames + 1:
@@ -276,9 +147,8 @@ def rollout(
         for t in range(context_frames, T - 1):
             gt_action = torch.tensor(actions[t], dtype=torch.float32, device=DEVICE)
 
-            # Preprocess frames
-            f_t   = preprocess(frames[t]).to(DEVICE)      # (1, 3, H, W)
-            f_t1  = preprocess(frames[t+1]).to(DEVICE)    # (1, 3, H, W)
+            f_t = preprocess(frames[t]).to(DEVICE)
+            f_t1 = preprocess(frames[t + 1]).to(DEVICE)
 
             # Context window for video model: (1, context_frames, 3, H, W)
             ctx = torch.cat(
@@ -288,39 +158,39 @@ def rollout(
 
             with torch.no_grad():
                 # 1. Video model prediction
-                f_pred = vm.predict_next_frame(ctx)        # (1, 3, H, W)
+                f_pred = vm.predict_next_frame(ctx)
 
                 # 2. IDM on (real_t, predicted_t+1) — main pipeline
-                x_vm  = torch.cat([f_t, f_pred], dim=1)   # (1, 6, H, W)
-                pred_vm = idm(x_vm)[0] * act_std + act_mean
+                x_vm = torch.cat([f_t, f_pred], dim=1)
+                pred_vm = idm_model(x_vm)[0] * act_std + act_mean
 
                 # 3. IDM on (real_t, real_t+1) — oracle upper bound
-                x_gt  = torch.cat([f_t, f_t1], dim=1)
-                pred_gt = idm(x_gt)[0] * act_std + act_mean
+                x_gt = torch.cat([f_t, f_t1], dim=1)
+                pred_gt = idm_model(x_gt)[0] * act_std + act_mean
 
                 # 4. IDM on (real_t, real_t) — "no motion" baseline
-                x_base  = torch.cat([f_t, f_t], dim=1)
-                pred_base = idm(x_base)[0] * act_std + act_mean
+                x_base = torch.cat([f_t, f_t], dim=1)
+                pred_base = idm_model(x_base)[0] * act_std + act_mean
 
-            mae_vm_idm.append((pred_vm   - gt_action).abs().cpu().numpy())
-            mae_idm_gt.append((pred_gt   - gt_action).abs().cpu().numpy())
+            mae_vm_idm.append((pred_vm - gt_action).abs().cpu().numpy())
+            mae_idm_gt.append((pred_gt - gt_action).abs().cpu().numpy())
             mae_baseline.append((pred_base - gt_action).abs().cpu().numpy())
 
-    mae_vm_idm   = np.stack(mae_vm_idm)    # (N, 2)
-    mae_idm_gt   = np.stack(mae_idm_gt)
+    mae_vm_idm = np.stack(mae_vm_idm)
+    mae_idm_gt = np.stack(mae_idm_gt)
     mae_baseline = np.stack(mae_baseline)
 
     def log_split(arr, prefix):
         return {
-            f"{prefix}/mae":       arr.mean(),
+            f"{prefix}/mae": arr.mean(),
             f"{prefix}/mae_steer": arr[:, 0].mean(),
             f"{prefix}/mae_accel": arr[:, 1].mean(),
         }
 
     metrics = {
-        **log_split(mae_vm_idm,   "vm_idm"),     # main: video model → IDM
-        **log_split(mae_idm_gt,   "oracle_idm"), # oracle: real next frame → IDM
-        **log_split(mae_baseline, "baseline"),   # no-motion baseline
+        **log_split(mae_vm_idm, "vm_idm"),
+        **log_split(mae_idm_gt, "oracle_idm"),
+        **log_split(mae_baseline, "baseline"),
         "n_samples": len(mae_vm_idm),
     }
 
