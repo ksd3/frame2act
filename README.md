@@ -4,7 +4,16 @@
 
 ### Motivation
 
-comma.ai builds its self-driving system around a world model: given the current state of the road, the model predicts what the next frame will look like, and from that predicted transition, infers the appropriate driving action. This is a compelling decomposition of the problem, and it was demonstrated to great effect by the winning team at comma hack 6. Their solutions really impressed me, and I wanted to see if I could go beyond what they had done. This repository is the result of that effort.
+comma.ai builds its self-driving system around a world model: given the current state of the road, the model predicts what the next frame will look like, and from that predicted transition, infers the appropriate driving action. This is a compelling decomposition of the problem, and it was demonstrated to great effect by the winning team at comma hack 6. Their solutions really impressed me, and I wanted to see if I could implement what they'd done — and perhaps push it a little further. This repository is the result of that effort.
+
+The idea of learning an inverse dynamics model from observation is, of course, not new. The approach here draws on a line of work in both traffic modeling and representation learning:
+
+- Treiber, Hennecke & Helbing, [*Congested Traffic States in Empirical Observations and Microscopic Simulations*](https://arxiv.org/abs/cond-mat/0002177) (2000) — the original Intelligent Driver Model, which introduced a clean parametric formulation for car-following dynamics.
+- Kesting, Treiber & Helbing, [*General Lane-Changing Model MOBIL for Car-Following Models*](https://journals.sagepub.com/doi/10.3141/1999-10) (2007) — the MOBIL lane-change model, extending IDM to multi-lane settings.
+- Treiber, Kesting & Helbing, [*Enhanced Intelligent Driver Model to Access the Impact of Driving Strategies on Traffic Capacity*](https://arxiv.org/abs/0912.3613) (2010) — fixes to IDM for adaptive cruise control and cut-in scenarios.
+- Mo, Shi & Di, [*A Physics-Informed Deep Learning Paradigm for Car-Following Models*](https://arxiv.org/abs/2012.13376) (2021) — PIDL-CF, which encodes IDM structure into neural network loss functions; the hybrid physics+learning approach most relevant to what we do here.
+- [*Limitations and Improvements of the Intelligent Driver Model*](https://epubs.siam.org/doi/10.1137/21M1406477) (2022) — mathematical well-posedness analysis and fixes for numerical stability.
+- [*Twenty-Five Years of the Intelligent Driver Model*](https://arxiv.org/abs/2506.05909) (2025) — a comprehensive survey covering the full ecosystem of IDM variants, extensions, and applications.
 
 The idea is to cleanly factor the pipeline into two stages. First, a video prediction model forecasts the next frame given a context window of past observations. Then, an inverse dynamics model (IDM) takes the current frame and the predicted next frame, and outputs the action — a two-dimensional vector of steering and acceleration — that would produce that transition. It turns out that training the IDM itself is relatively straightforward (a few minutes on an H100), and the quality of the overall system depends primarily on how well the video model can anticipate the future.
 
